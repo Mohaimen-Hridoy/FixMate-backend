@@ -1,0 +1,244 @@
+// FixMate — Database Schema (Part 1: Setup & Database)
+// Models mirror the frontend types in `src/lib/data.ts` and the form
+// contracts in `src/lib/validation.ts` (Phase 10 frontend) so that the
+// API layer built in later parts maps onto these 1:1 with no surprises.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-1.0.x", "rhel-openssl-3.0.x"]
+}
+
+
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ────────────────────────────────
+// Enums
+// ────────────────────────────────
+
+enum Role {
+  CUSTOMER
+  PROVIDER
+  ADMIN
+}
+
+// Account-level moderation flag — separate from Role, which never changes
+// once a user picks Customer/Provider at signup. Set by the admin
+// dashboard's Users table (see admin.service.ts).
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum PriceUnit {
+  job
+  hour
+  visit
+}
+
+enum BookingStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+// ────────────────────────────────
+// Core identity
+// ────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(CUSTOMER)
+  status       UserStatus @default(ACTIVE)
+  phone        String?
+  address      String?
+  avatarUrl    String?
+  isVerifiedEmail Boolean @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Role-specific profile — present only for PROVIDER accounts
+  providerProfile ProviderProfile?
+
+  bookings      Booking[]       @relation("CustomerBookings")
+  reviewsWritten Review[]       @relation("CustomerReviews")
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+// One-to-one extension of User for the PROVIDER role.
+// Kept separate so Customer/Admin rows never carry unused provider columns.
+model ProviderProfile {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  businessName   String
+  avatarInitial  String
+  categorySlug   String
+  location       String   @default("")
+  bio            String
+  yearsActive    Int      @default(0)
+  verified       Boolean  @default(false)
+  jobsCompleted  Int      @default(0)
+  responseTime   String   @default("Under 24 hours")
+  serviceAreas   String[] @default([])
+
+  // Denormalized aggregates, recalculated whenever a Review is
+  // created/updated for one of this provider's services.
+  rating      Float @default(0)
+  reviewCount Int   @default(0)
+
+  services Service[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([categorySlug])
+  @@map("provider_profiles")
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ────────────────────────────────
+// Catalog
+// ────────────────────────────────
+
+model Category {
+  id    String @id @default(cuid())
+  slug  String @unique
+  name  String
+  icon  String
+
+  // Denormalized cache of Service count in this category, refreshed on
+  // service create/delete so the Explore page can read it without a join.
+  count Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("categories")
+}
+
+model Service {
+  id               String    @id @default(cuid())
+  slug             String    @unique
+  title            String
+  categorySlug     String
+  shortDescription String
+  description      String    @default("")
+  price            Decimal   @db.Decimal(10, 2)
+  priceUnit        PriceUnit @default(job)
+  location         String
+  available        Boolean   @default(true)
+  features         String[]  @default([])
+
+  // Denormalized aggregates, recalculated whenever a Review is
+  // created/updated for this service.
+  rating      Float @default(0)
+  reviewCount Int   @default(0)
+
+  providerId String
+  provider   ProviderProfile @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  bookings Booking[]
+  reviews  Review[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([categorySlug])
+  @@index([location])
+  @@index([providerId])
+  @@map("services")
+}
+
+// ────────────────────────────────
+// Transactions
+// ────────────────────────────────
+
+model Booking {
+  id      String        @id @default(cuid())
+  status  BookingStatus @default(PENDING)
+
+  date    DateTime
+  time    String
+  address String
+  notes   String?
+
+  // Snapshot of Service.price at booking time — the service's price can
+  // change later without silently altering what an existing booking owes.
+  amount Decimal @db.Decimal(10, 2)
+
+  // Set once a Review exists for this booking (see Part 5) — lets the
+  // customer dashboard hide "Leave a review" after one's been submitted
+  // without a join on every list render.
+  reviewed Boolean @default(false)
+
+  // Ordered [{ status, at, note? }] audit trail — mirrors
+  // `BookingHistoryEntry[]` in the frontend's `src/lib/data.ts`. Kept as
+  // JSON rather than a child table since it's append-only, always read as
+  // a whole, and never queried by its own fields.
+  history Json @default("[]")
+
+  customerId String
+  customer   User @relation("CustomerBookings", fields: [customerId], references: [id], onDelete: Cascade)
+
+  serviceId String
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  review Review?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+  @@index([serviceId])
+  @@index([status])
+  @@map("bookings")
+}
+
+model Review {
+  id      String @id @default(cuid())
+  rating  Int
+  comment String
+
+  customerId String
+  customer   User @relation("CustomerReviews", fields: [customerId], references: [id], onDelete: Cascade)
+
+  serviceId String
+  service   Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  // A review always traces back to the completed booking that earned it —
+  // enforces one review per booking.
+  bookingId String  @unique
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([serviceId])
+  @@index([customerId])
+  @@map("reviews")
+}
